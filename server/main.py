@@ -1,163 +1,100 @@
-# server/main.py
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
-from typing import Optional, List
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 import os
-
-# Thêm path để import app/
-import sys, pathlib
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))
-
+import threading
+import time
+from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
+import requests
+
+# Load biến môi trường
 load_dotenv()
 
-from app.common import store
-from app.common.normalizer import unify
-from app.common.telegramer import send_async as tg_send, pretty_message as tg_msg
-from app.carriers import mock, ghn, spx, vtp, jnt
+# ============================
+#   Khởi tạo app FastAPI
+# ============================
+app = FastAPI(title="ShipTrack Server")
 
-# Khởi tạo DB
-store.init_db()
+# Cho phép CORS (nếu bạn muốn gọi API từ web app)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-CARRIERS = {"mock": mock, "ghn": ghn, "spx": spx, "vtp": vtp, "jnt": jnt}
 
-app = FastAPI(title="ShipTrack API", version="1.0.0")
-
-
-class CreateReq(BaseModel):
-    label: str
-    carrier: str
-    code: str
-    jnt_phone4: Optional[str] = None
-    auto_poll: bool = True
-
+# ============================
+#   Các route cơ bản
+# ============================
+@app.get("/")
+def root():
+    """Trang gốc để kiểm tra server"""
+    return {"message": "ShipTrack server is running"}
 
 @app.get("/health")
 def health():
+    """Kiểm tra tình trạng hệ thống"""
     return {"ok": True}
 
 
-@app.get("/shipments")
-def list_shipments():
-    rows = store.list_shipments()
-    return [dict(r) for r in rows]
+# ============================
+#   API ví dụ: cập nhật trạng thái đơn hàng
+# ============================
+@app.get("/refresh")
+def refresh():
+    """Ví dụ API test refresh"""
+    return {"message": "Đã chạy cập nhật thủ công!"}
 
 
-@app.post("/shipments")
-def add_shipment(req: CreateReq):
-    carrier = req.carrier.lower()
-    if carrier not in CARRIERS:
-        raise HTTPException(400, detail="carrier invalid")
+# ============================
+#   Telegram Notifier (sẽ dùng sau)
+# ============================
+def send_telegram_message(msg: str):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    enabled = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 
-    backend = CARRIERS[carrier]
-
-    # Gọi API theo hãng
-    if carrier == "jnt":
-        phone = (req.jnt_phone4 or "").strip()
-        if not (phone.isdigit() and len(phone) == 4):
-            raise HTTPException(400, detail="jnt_phone4 (4 số cuối) required for J&T")
-        vendor = backend.get_tracking(req.code, phone)
-    else:
-        vendor = backend.get_tracking(req.code)
-
-    unified = unify(carrier if carrier != "mock" else "ghn",
-                    req.code, vendor["latest_event"])
-    store.add_shipment(req.label or "(Không tên)",
-                       carrier, req.code, unified,
-                       auto_poll=1 if req.auto_poll else 0)
-
-    # Gửi telegram thông báo trạng thái hiện tại (optional)
-    try:
-        text = tg_msg(req.label or "(Không tên)", carrier, req.code,
-                      unified.latest.text, unified.latest.location, unified.latest.time_iso)
-        tg_send(text)
-    except Exception:
-        pass
-
-    return {"ok": True}
-
-
-@app.delete("/shipments/{sid}")
-def delete_shipment(sid: int):
-    store.delete_shipment(sid)
-    return {"ok": True}
-
-
-@app.post("/shipments/{sid}/refresh")
-def refresh_one(sid: int, jnt_phone4: Optional[str] = Query(default=None)):
-    con = store.connect()
-    row = con.execute("SELECT * FROM shipments WHERE id=?", (sid,)).fetchone()
-    con.close()
-    if not row:
-        raise HTTPException(404, detail="not found")
-
-    carrier = row["carrier"]
-    code = row["tracking_code"]
-    backend = CARRIERS.get(carrier)
-    if not backend:
-        raise HTTPException(400, detail="carrier invalid")
+    if not enabled or not token or not chat_id:
+        print("[Telegram] Chưa bật hoặc chưa cấu hình.")
+        return
 
     try:
-        if carrier == "jnt":
-            phone = (jnt_phone4 or "").strip()
-            if not (phone.isdigit() and len(phone) == 4):
-                raise HTTPException(400, detail="jnt_phone4 required for J&T")
-            vendor = backend.get_tracking(code, phone)
-        else:
-            vendor = backend.get_tracking(code)
-
-        unified = unify(carrier if carrier != "mock" else "ghn",
-                        code, vendor["latest_event"])
-        changed = store.update_shipment_from_unified(sid, unified)
-
-        # gửi telegram nếu có thay đổi
-        if changed:
-            try:
-                text = tg_msg(row["label"], carrier, code,
-                              unified.latest.text, unified.latest.location, unified.latest.time_iso)
-                tg_send(text)
-            except Exception:
-                pass
-
-        return {"ok": True, "changed": bool(changed)}
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg},
+            timeout=10,
+        )
+        print("[Telegram] Gửi thông báo thành công.")
     except Exception as e:
-        raise HTTPException(500, detail=str(e))
+        print(f"[Telegram] Lỗi: {e}")
 
 
-# -----------------------------
-# Auto refresh nền bằng APScheduler
-# -----------------------------
-from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime
+# ============================
+#   Scheduler auto refresh
+# ============================
+def auto_refresh_job():
+    print("[Job] Đang chạy auto refresh đơn hàng...")
+    # Ở đây bạn có thể gọi API GHN/SPX/J&T để cập nhật
+    # Ví dụ gửi thông báo Telegram khi chạy
+    send_telegram_message("🚚 ShipTrack: Đang tự động cập nhật đơn hàng!")
 
-def refresh_all_job():
-    try:
-        con = store.connect()
-        rows = con.execute("SELECT id, label, carrier, tracking_code FROM shipments WHERE auto_poll=1").fetchall()
-        con.close()
-        for r in rows:
-            try:
-                # J&T cần phone — ở web API này, job nền bỏ qua J&T (hoặc bạn có thể thêm bảng phone)
-                if r["carrier"] == "jnt":
-                    continue
-                backend = CARRIERS[r["carrier"]]
-                vendor = backend.get_tracking(r["tracking_code"])
-                unified = unify(r["carrier"] if r["carrier"] != "mock" else "ghn",
-                                r["tracking_code"], vendor["latest_event"])
-                changed = store.update_shipment_from_unified(r["id"], unified)
-                if changed:
-                    text = tg_msg(r["label"], r["carrier"], r["tracking_code"],
-                                  unified.latest.text, unified.latest.location, unified.latest.time_iso)
-                    tg_send(text)
-            except Exception:
-                continue
-    except Exception:
-        pass
 
-scheduler = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
-scheduler.add_job(refresh_all_job, "interval", minutes=3, id="refresh_all")
-scheduler.start()
+ENABLE_SCHED = os.getenv("SCHED_ENABLED", "true").lower() == "true"
 
-# Uvicorn entrypoint: uvicorn server.main:app --host 0.0.0.0 --port 8000
+if ENABLE_SCHED:
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(auto_refresh_job, "interval", minutes=3, id="auto_refresh")
+    scheduler.start()
+    print("[Scheduler] Bật chế độ auto refresh mỗi 3 phút.")
+else:
+    print("[Scheduler] Đang tắt auto refresh.")
+
+
+# ============================
+#   Chạy app cục bộ (nếu cần test)
+# ============================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server.main:app", host="0.0.0.0", port=8000, reload=True)
