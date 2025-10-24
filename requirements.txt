@@ -3,6 +3,4 @@ uvicorn
 python-dotenv
 requests
 apscheduler
-pytz
-tzlocal
 psycopg2-binary
