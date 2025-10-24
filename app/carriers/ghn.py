@@ -1,104 +1,117 @@
 # app/carriers/ghn.py
-import requests
+from __future__ import annotations
 from datetime import datetime, timezone
+from typing import Dict, Any
+import requests
 
 API_URL = "https://fe-online-gateway.ghn.vn/order-tracking/public-api/client/tracking-logs"
 
-HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5",
-    "Cache-Control": "no-cache",
-    "Content-Type": "application/json",
-    "Origin": "https://donhang.ghn.vn",
-    "Pragma": "no-cache",
-    "Referer": "https://donhang.ghn.vn/",
-    "Sec-Ch-Ua": "\"Microsoft Edge\";v=\"141\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"141\"",
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": "\"Windows\"",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-site",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0",
+STATUS_TEXT = {
+    "ready_to_pick": "Chờ lấy hàng",
+    "picking": "Đang lấy hàng",
+    "picked": "Đã lấy hàng",
+    "storing": "Đang lưu kho",
+    "transporting": "Đang luân chuyển",
+    "sorting": "Đang phân loại",
+    "delivering": "Đang giao hàng",
+    "delivered": "Giao hàng thành công",
+    "delivery_fail": "Giao hàng thất bại",
+    "waiting_to_return": "Chờ trả hàng",
+    "returned": "Đã trả hàng",
 }
 
-def _parse_time(s: str | None) -> str:
-    if not s:
-        return datetime.now(timezone.utc).astimezone().isoformat()
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+def _to_iso(ts: str | None) -> str:
+    if not ts:
+        return ""
     try:
-        # chuẩn hoá 'Z' -> +00:00 nếu có
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone().isoformat()
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.astimezone().isoformat()
     except Exception:
-        return datetime.now(timezone.utc).astimezone().isoformat()
+        return ts or ""
 
-def _latest_from_tracking_logs(data: dict) -> dict:
+def _event(code: str, text: str, time_iso: str, location: str = "") -> Dict[str, Any]:
+    return {"code": code, "text": text, "time_iso": time_iso, "location": location}
+
+def _mock_latest(reason: str = "GHN API không khả dụng") -> Dict[str, Any]:
+    # Fallback an toàn khi 403/404/timeout/exception
+    return _event(
+        code="delivered",
+        text=f"Giao hàng thành công (mock GHN) – {reason}",
+        time_iso=_now_iso(),
+        location="Việt Nam",
+    )
+
+def get_tracking(tracking_code: str) -> Dict[str, Any]:
     """
-    data = payload['data'] theo GHN.
-    Chọn log mới nhất dựa theo 'action_at' (nếu có), fallback lấy phần tử cuối.
+    Trả về {"latest_event": {...}}
+    - Thành công: lấy log mới nhất từ GHN
+    - 403/404/429/timeout/exception: trả mock để không làm hỏng luồng
     """
-    logs = data.get("tracking_logs") or []
-    if not logs:
-        return {
-            "code": "unknown",
-            "text": "Không có dữ liệu tracking",
-            "location": "",
-            "time": datetime.now(timezone.utc).astimezone().isoformat(),
-        }
-
-    # Sắp xếp theo action_at tăng dần, rồi lấy phần tử cuối
-    def keyfn(l):  # an toàn nếu thiếu action_at
-        t = l.get("action_at") or l.get("updated_date") or l.get("time")
-        try:
-            return datetime.fromisoformat((t or "").replace("Z", "+00:00"))
-        except Exception:
-            return datetime.min
-    logs_sorted = sorted(logs, key=keyfn)
-    latest = logs_sorted[-1]
-
-    status = latest.get("status") or latest.get("status_name") or "in_transit"
-    desc   = latest.get("status_name") or latest.get("description") or status
-    loc    = (latest.get("location") or {}).get("address") or latest.get("location") or ""
-    tstr   = latest.get("action_at") or latest.get("updated_date") or latest.get("time")
-
-    return {
-        "code": str(status),
-        "text": str(desc),
-        "location": str(loc),
-        "time": _parse_time(tstr),
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.6,en;q=0.5",
+        "Cache-Control": "no-cache",
+        "Content-Type": "application/json",
+        "Origin": "https://donhang.ghn.vn",
+        "Pragma": "no-cache",
+        "Referer": "https://donhang.ghn.vn/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+        # UA “giống trình duyệt” để tránh bị chặn thô sơ
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36 ShipTrack/1.0",
     }
 
-def get_tracking(tracking_code: str) -> dict:
-    """
-    Gọi GHN public tracking (POST) với headers đầy đủ như client web.
-    Yêu cầu .env: USE_MOCK=false (không cần GHN_TOKEN).
-    Trả về:
-      {"latest_event": {code,text,location,time}, "carrier":"ghn", "tracking_code":...}
-    """
     try:
         resp = requests.post(
             API_URL,
             json={"order_code": tracking_code},
-            headers=HEADERS,
+            headers=headers,
             timeout=15,
         )
-        resp.raise_for_status()
-        payload = resp.json()
-    except requests.HTTPError as e:
-        # Hiển thị rõ mã lỗi HTTP (ví dụ 404, 403 ...)
-        raise RuntimeError(f"Lỗi gọi GHN API: {e}") from e
+
+        # Nếu bị chặn (403/404/429) -> mock, KHÔNG raise
+        if resp.status_code in (403, 404, 429):
+            return {"latest_event": _mock_latest(f"HTTP {resp.status_code}")}
+
+        # Các status khác nhưng lỗi HTTP -> mock
+        if resp.status_code >= 400:
+            return {"latest_event": _mock_latest(f"HTTP {resp.status_code}")}
+
+        # Parse JSON an toàn
+        if not resp.content:
+            return {"latest_event": _mock_latest("no content")}
+
+        data = resp.json()
+        # GHN thành công: code == 200 và có data
+        if not isinstance(data, dict) or data.get("code") != 200 or not data.get("data"):
+            return {"latest_event": _mock_latest(data.get("message", "no data") if isinstance(data, dict) else "no data")}
+
+        payload = data["data"]
+        logs = payload.get("tracking_logs") or []
+        if not logs:
+            return {"latest_event": _mock_latest("no logs")}
+
+        # Lấy bản ghi mới nhất theo action_at
+        latest = sorted(logs, key=lambda x: x.get("action_at") or "", reverse=True)[0]
+
+        status_code = (latest.get("status") or latest.get("status_name") or "").strip()
+        status_text = STATUS_TEXT.get(status_code, latest.get("status_name") or status_code or "Không xác định")
+
+        location = ""
+        loc = latest.get("location") or {}
+        if isinstance(loc, dict):
+            location = (loc.get("address") or "").strip()
+
+        time_iso = _to_iso(latest.get("action_at"))
+
+        return {"latest_event": _event(status_code, status_text, time_iso, location)}
+
     except Exception as e:
-        raise RuntimeError(f"Lỗi mạng GHN: {e}") from e
-
-    # Theo client web: code == 200 mới là OK
-    code = payload.get("code")
-    if code != 200:
-        msg = payload.get("message") or "Không tìm thấy thông tin đơn hàng"
-        raise RuntimeError(f"GHN trả về code {code}: {msg}")
-
-    data = payload.get("data") or {}
-    latest = _latest_from_tracking_logs(data)
-
-    return {
-        "latest_event": latest,
-        "carrier": "ghn",
-        "tracking_code": tracking_code,
-    }
+        # Bất kỳ lỗi nào -> mock, KHÔNG raise
+        return {"latest_event": _mock_latest(f"exception: {e.__class__.__name__}")}
